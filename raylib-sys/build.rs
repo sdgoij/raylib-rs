@@ -207,7 +207,22 @@ fn build_with_cmake(src_path: &str) {
         {
             builder.define("OPENGL_VERSION", "ES 3.0");
             println!("cargo:rustc-link-lib=GLESv2");
-            println!("cargo:rustc-link-lib=GLdispatch");
+
+            // GLdispatch is a GLVND library, which is desktop Linux only.
+            // Android has no such thing: its ES 2.0 *and* ES 3.x entry points
+            // live in libGLESv2.so, which the Android arm of `link()` asks for
+            // by itself. Emitting this unconditionally made the feature unusable
+            // for the one platform it was wanted on.
+            // Emscripten has no GLVND either: `wasm-ld: error: unable to find
+            // library -lGLdispatch` (WASM.md risk 2). Same name, second
+            // platform, so the same gate -- desktop Linux is what has it, and no
+            // cross target does.
+            if env::var("CARGO_CFG_TARGET_OS")
+                .map(|os| os != "android" && os != "emscripten")
+                .unwrap_or(true)
+            {
+                println!("cargo:rustc-link-lib=GLdispatch");
+            }
         }
     }
 
@@ -229,18 +244,71 @@ fn build_with_cmake(src_path: &str) {
             }
         }
         Platform::Memory => conf.define("PLATFORM", "Memory"),
-        Platform::Web => conf.define("PLATFORM", "Web"),
+        Platform::Web => {
+            // Emscripten's toolchain file, named explicitly: without it cmake-rs
+            // also decides the compiler itself from the `cc` crate's guess.
+            let emscripten = env::var("EMSCRIPTEN")
+                .or_else(|_| env::var("EMSDK").map(|sdk| format!("{sdk}/upstream/emscripten")))
+                .expect("a wasm build needs emsdk active (EMSCRIPTEN or EMSDK set)");
+            let toolchain_file = format!("{emscripten}/cmake/Modules/Platform/Emscripten.cmake");
+
+            // cmake-rs wraps every configure in `emcmake` and every build in
+            // `emmake` (`cmake_configure_command`/`cmake_build_command`), and
+            // spawns each by bare name. On Windows the SDK ships
+            // `emcmake.bat`/`emmake.bat` and only the extension-qualified name
+            // resolves, so they are named for it.
+            if cfg!(windows) {
+                // SAFETY: a build script is single-threaded, and this runs before
+                // cmake-rs reads either variable.
+                unsafe {
+                    env::set_var("EMCMAKE", "emcmake.bat");
+                    env::set_var("EMMAKE", "emmake.bat");
+                }
+            }
+
+            conf.define("PLATFORM", "Web")
+                // cmake-rs fills each `CMAKE_<lang>_FLAGS` from the
+                // `cc`-detected compiler's arguments unless the variable is
+                // already defined (`set_compiler`, which checks
+                // `self.defined(&flag_var)` first). On Windows the Emscripten
+                // compiler arrives wrapped, so the value comes out as
+                // ` /c emcc.bat -ffunction-sections ...` -- and clang reads
+                // `/c` and `emcc.bat` as two missing files, once per source.
+                // Defining them (to nothing) is what stops the injection: the
+                // same repair, for the same reason, as the Android arm above.
+                .define("CMAKE_C_FLAGS", "")
+                .define("CMAKE_CXX_FLAGS", "")
+                .define("CMAKE_ASM_FLAGS", "")
+                .define("CMAKE_TOOLCHAIN_FILE", toolchain_file)
+        }
         Platform::Drm => conf.define("PLATFORM", "DRM"),
         Platform::Rpi => conf.define("PLATFORM", "Raspberry Pi"),
         Platform::Android => {
             // get required env variables
             let android_ndk_home = env::var("ANDROID_NDK_HOME")
                 .expect("Please set the environment variable: ANDROID_NDK_HOME:(e.g /home/u/Android/Sdk/ndk/VXXX/)");
-            let android_platform = target.split("-").last().expect("fail to parse the android version of the target triple, example:'aarch64-linux-android25'");
-            let abi_version = android_platform
-                .split("-")
-                .last()
-                .expect("Could not get abi version. Is ANDROID_PLATFORM valid?");
+            // The API level is the number the NDK bakes into the LLVM triple and
+            // the sysroot path. Take it, in order of authority, from
+            // ANDROID_PLATFORM (what `cargo ndk -P` and CI set), then from the
+            // triple's own suffix (`aarch64-linux-android25`), then from a floor
+            // -- never from a bare `android`, which the toolchain appends to
+            // `aarch64-none-linux-android` and breaks the sysroot lookup with
+            // (`aarch64-none-linux-androidandroid`, no crtbegin_dynamic.o).
+            let api_level = env::var("ANDROID_PLATFORM")
+                .ok()
+                .map(|platform| platform.trim_start_matches("android-").to_string())
+                .filter(|platform| !platform.is_empty())
+                .or_else(|| {
+                    target
+                        .split('-')
+                        .next_back()
+                        .and_then(|last| last.strip_prefix("android"))
+                        .filter(|level| !level.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "24".to_string());
+            let android_platform = format!("android-{api_level}");
+            let abi_version = api_level;
             let toolchain_file =
                 format!("{}/build/cmake/android.toolchain.cmake", &android_ndk_home);
             // Detect ANDROID_ABI using the target triple
@@ -270,6 +338,19 @@ fn build_with_cmake(src_path: &str) {
                 .define("CMAKE_ANDROID_ARCH_ABI", android_arch_abi)
                 .define("CMAKE_ANDROID_NDK", &android_ndk_home)
                 .define("ANDROID_PLATFORM", android_platform)
+                // cmake-rs copies the `cc`-detected compiler's args into
+                // CMAKE_C_FLAGS, and `cc` guesses a bare
+                // `--target=aarch64-linux-android` for android triples. That
+                // lands *after* the toolchain's own
+                // `--target=aarch64-none-linux-android24` and therefore wins, so
+                // clang looks for the crt objects in the unqualified sysroot dir
+                // and the C-compiler test fails with "cannot open
+                // crtbegin_dynamic.o". Defining the flag variables (to nothing)
+                // stops cmake-rs from injecting them and leaves the toolchain's
+                // API-qualified flags in charge.
+                .define("CMAKE_C_FLAGS", "")
+                .define("CMAKE_CXX_FLAGS", "")
+                .define("CMAKE_ASM_FLAGS", "")
                 .define("CMAKE_TOOLCHAIN_FILE", &toolchain_file)
         }
     };
@@ -485,9 +566,12 @@ fn link(platform: Platform, platform_os: PlatformOS) {
             println!("cargo:rustc-link-lib=dylib=shell32");
         }
         PlatformOS::Linux => {
-            // X11 linking
-            #[cfg(not(any(feature = "wayland", target_os = "android", feature = "drm")))]
-            {
+            // X11 linking. Gated on the runtime `platform` rather than on
+            // `cfg!(target_os = "android")`: that cfg is the *host*'s OS in a
+            // build script, so on a Linux host targeting Android it is false and
+            // this links X11 into the Android .so.
+            #[cfg(not(any(feature = "wayland", feature = "drm")))]
+            if platform != Platform::Android {
                 println!("cargo:rustc-link-search=/usr/local/lib");
                 println!("cargo:rustc-link-lib=X11");
             }
@@ -719,7 +803,12 @@ enum PlatformOS {
 /// You should be copy pasting into both raylib/raylib-sys `Cargo.toml` and here while keeping it as close as possible to raylibs `config.h`` for easy maintenance
 #[rustfmt::skip]
 fn features_from_env(cmake: &mut Config) {
-    let is_android = cfg!(target_os = "android"); // skip linking to x11 & wayland
+    // NOTE: `cfg!(target_os = ...)` is the *host* here, because a build script is
+    // compiled for the host -- so every Android-specific decision below was
+    // silently dead. Take the target from cargo instead.
+    let is_android = env::var("CARGO_CFG_TARGET_OS")
+        .map(|os| os == "android")
+        .unwrap_or(false);
     cmake.define("ENABLE_ASAN", bstr(cfg!(feature = "ENABLE_ASAN")));
     cmake.define("ENABLE_UBSAN", bstr(cfg!(feature = "ENABLE_UBSAN")));
     cmake.define("ENABLE_MSAN", bstr(cfg!(feature = "ENABLE_MSAN")));
@@ -731,11 +820,17 @@ fn features_from_env(cmake: &mut Config) {
     // non-DRM/non-Web platform when both GLFW backends are off. Force X11 on under
     // software_renderer to satisfy that guard — the GLFW X11 backend is not compiled
     // for the Memory platform.
-    let force_x11 = cfg!(feature = "software_renderer");
+    //
+    // Android is the same shape and the same fix: CMake counts it as UNIX and its
+    // PLATFORM matches neither DRM nor Web, so the guard fires, while GLFW is never
+    // compiled for Android at all (rglfw.c is desktop-only). Note that the `&& !is_android`
+    // below is what used to force both backends off on Android, i.e. what tripped the
+    // guard in the first place.
+    let force_x11 = cfg!(feature = "software_renderer") || is_android;
     cmake.define("GLFW_BUILD_WAYLAND", bstr(cfg!(feature = "GLFW_BUILD_WAYLAND") && !is_android));
     cmake.define(
         "GLFW_BUILD_X11",
-        bstr((cfg!(feature = "GLFW_BUILD_X11") || force_x11) && !is_android),
+        bstr(cfg!(feature = "GLFW_BUILD_X11") || force_x11),
     );
     cmake.define("INCLUDE_EVERYTHING", bstr(cfg!(feature = "INCLUDE_EVERYTHING")));
     cmake.define("USE_AUDIO", bstr(cfg!(feature = "USE_AUDIO")));
