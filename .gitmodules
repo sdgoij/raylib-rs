@@ -1,6 +1,6 @@
 [submodule "raylib-sys/raylib"]
 	path = raylib-sys/raylib
-	url = https://github.com/raysan5/raylib
+	url = https://github.com/sdgoij/raylib.git
 	commit = "6.0"
 	shallow = true
 [submodule "raylib-sys/raygui-examples"]
