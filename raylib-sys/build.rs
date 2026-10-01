@@ -833,7 +833,15 @@ fn features_from_env(cmake: &mut Config) {
         bstr(cfg!(feature = "GLFW_BUILD_X11") || force_x11),
     );
     cmake.define("INCLUDE_EVERYTHING", bstr(cfg!(feature = "INCLUDE_EVERYTHING")));
-    cmake.define("USE_AUDIO", bstr(cfg!(feature = "USE_AUDIO")));
+    // raylib's web audio is miniaudio over WebAudio, and miniaudio spin-waits on
+    // `emscripten_sleep` during init (`miniaudio.h`), which only works with async
+    // support. A wasm build without it cannot initialise audio, so the audio
+    // module is left out there; audio returns with a later WASM.md slice.
+    cmake.define(
+        "USE_AUDIO",
+        bstr(cfg!(feature = "USE_AUDIO")
+            && env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32")),
+    );
     cmake.define("SUPPORT_MODULE_RSHAPES", bstr(cfg!(feature = "SUPPORT_MODULE_RSHAPES")));
     cmake.define("SUPPORT_MODULE_RTEXTURES", bstr(cfg!(feature = "SUPPORT_MODULE_RTEXTURES")));
     cmake.define("SUPPORT_MODULE_RTEXT", bstr(cfg!(feature = "SUPPORT_MODULE_RTEXT")));
